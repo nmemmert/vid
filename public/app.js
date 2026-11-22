@@ -42,32 +42,33 @@ function showLogin(msg = '') {
   document.title = 'Famtube';
   view.innerHTML = `<form class="login" id="lf">
     <span class="logo">▶</span><h1>Famtube</h1>
-    <p style="margin:0;color:var(--mute)">Videos just for our family. Type the family code and your name.</p>
-    <input type="password" name="pin" placeholder="Family code" autocomplete="current-password" required>
-    <input type="text" name="name" placeholder="Your name" value="${esc(lsGet('ft-name') || '')}" autocomplete="given-name" autocapitalize="words" maxlength="30" required>
+    <p style="margin:0;color:var(--mute)">Videos just for our family. New here? Pick a name and make your own password.</p>
+    <input type="password" name="pin" placeholder="Family code" autocomplete="off" required>
+    <input type="text" name="name" placeholder="Your name" value="${esc(lsGet('ft-name') || '')}" autocomplete="username" autocapitalize="words" maxlength="30" required>
+    <input type="password" name="password" placeholder="Your password" autocomplete="current-password" minlength="4" required>
     <div class="err" id="err">${esc(msg)}</div>
     <button class="btn">Come on in</button></form>`;
   $('#lf').onsubmit = async (e) => {
     e.preventDefault();
     const f = e.target, btn = $('button', f); btn.disabled = true;
     try {
-      const r = await api('/api/login', { json: { pin: f.pin.value, name: f.name.value } });
+      const r = await api('/api/login', { json: { pin: f.pin.value, name: f.name.value, password: f.password.value } });
       lsSet('ft-name', r.user.name); me = r.user; boot();
     } catch (er) { $('#err').textContent = er.message; btn.disabled = false; }
   };
 }
 
 // ---------- cards ----------
-function card(v) {
+function card(v, list = '') {
   const ready = v.status === 'ready';
   const badge = v.status === 'processing' ? '<span class="badge">Getting ready…</span>' : v.status === 'failed' ? '<span class="badge bad">Could not convert</span>' : '';
-  return `<a class="card" href="#/watch/${v.id}">
+  return `<a class="card" href="#/watch/${v.id}${list ? '/' + list : ''}">
     <div class="thumb">${ready ? `<img loading="lazy" src="/media/${v.id}/thumb" alt="" onerror="this.remove()">` : ''}${badge}${ready && v.duration ? `<span class="dur">${dur(v.duration)}</span>` : ''}</div>
     <div class="meta">${avatar(v.owner)}<div><h3>${esc(v.title)}</h3><p>${esc(v.owner.name)} · ${views(v.views)} · ${ago(v.created)}</p></div></div></a>`;
 }
-function listHtml(list, empty) {
+function listHtml(list, empty, plId = '') {
   if (!list.length) return `<div class="empty"><b>${esc(empty[0])}</b>${esc(empty[1] || '')}</div>`;
-  return `<div class="grid">${list.map(card).join('')}</div>`;
+  return `<div class="grid">${list.map((v) => card(v, plId)).join('')}</div>`;
 }
 function pollIfProcessing(list, reload) {
   clearTimeout(pollTimer);
@@ -130,17 +131,109 @@ function pageUpload() {
   };
 }
 
+// ---------- push notifications ----------
+const b64uToBytes = (s) => Uint8Array.from(atob(s.replace(/-/g, '+').replace(/_/g, '/')), (c) => c.charCodeAt(0));
+const pushSupported = () => 'serviceWorker' in navigator && 'PushManager' in window && 'Notification' in window;
+async function pushSub() { const reg = await navigator.serviceWorker.ready; return { reg, sub: await reg.pushManager.getSubscription() }; }
+async function pushOn() {
+  if (await Notification.requestPermission() !== 'granted') throw new Error('Notifications are blocked. Turn them on for Famtube in Settings → Notifications.');
+  const { reg, sub } = await pushSub();
+  const { key } = await api('/api/push/key');
+  const s = sub || await reg.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: b64uToBytes(key) });
+  await api('/api/push/subscribe', { json: s.toJSON() });
+}
+async function pushOff() {
+  const { sub } = await pushSub();
+  if (sub) { await api('/api/push/unsubscribe', { json: { endpoint: sub.endpoint } }).catch(() => {}); await sub.unsubscribe(); }
+}
+async function renderPushCard() {
+  const el = $('#push'); if (!el) return;
+  const standalone = navigator.standalone || matchMedia('(display-mode: standalone)').matches;
+  if (!pushSupported()) {
+    el.innerHTML = standalone ? 'This device does not support notifications.'
+      : '<b>Want a buzz when someone adds a video?</b><br>Tap <b>Share</b> in Safari → <b>Add to Home Screen</b>, open Famtube from your Home Screen, then turn on notifications here.';
+    return;
+  }
+  const { sub } = await pushSub();
+  const on = !!sub && Notification.permission === 'granted';
+  el.innerHTML = `<b>New video alerts</b><br>${on ? 'On for this phone.' : 'Get a notification when someone adds a video.'}<div style="margin-top:10px"><button class="btn sm ${on ? 'ghost' : ''}" id="pt">${on ? 'Turn off' : 'Turn on notifications'}</button></div>`;
+  $('#pt').onclick = async () => {
+    try { on ? await pushOff() : await pushOn(); toast(on ? 'Notifications off' : 'Notifications on'); } catch (e) { toast(e.message); }
+    renderPushCard();
+  };
+}
+async function syncPush() { // keep this device's subscription tied to whoever is signed in
+  try { if (pushSupported() && Notification.permission === 'granted') { const { sub } = await pushSub(); if (sub) await api('/api/push/subscribe', { json: sub.toJSON() }); } } catch { /* ignore */ }
+}
+
+// ---------- playlists ----------
+function plRow(p) {
+  return `<a class="pl" href="#/pl/${p.id}"><div class="pt">${p.cover ? `<img src="/media/${p.cover}/thumb" alt="" onerror="this.remove()">` : ''}</div>
+    <div><b>${esc(p.name)}</b><br><small>${p.count} video${p.count === 1 ? '' : 's'} · ${esc(p.owner ? p.owner.name : '')}</small></div></a>`;
+}
+async function newPlaylist() {
+  const name = prompt('Name your playlist (like "Summer trip")'); if (!name || !name.trim()) return null;
+  return api('/api/playlists', { json: { name } });
+}
+async function savePicker(vid) {
+  const pls = await api('/api/playlists');
+  const d = document.createElement('div'); d.className = 'sheet';
+  d.innerHTML = `<div class="box"><h3>Save to…</h3>${pls.map((p) => `<button data-id="${p.id}">${esc(p.name)} <small>${p.count}</small></button>`).join('')}
+    <button data-new>＋ New playlist</button><button data-x class="x">Close</button></div>`;
+  const close = () => d.remove();
+  d.onclick = async (e) => {
+    const b = e.target.closest('button');
+    if (e.target === d || (b && 'x' in b.dataset)) return close();
+    if (!b) return;
+    try {
+      let id = b.dataset.id;
+      if ('new' in b.dataset) { const p = await newPlaylist(); if (!p) return; id = p.id; }
+      await api(`/api/playlists/${id}/videos`, { json: { video: vid } }); close(); toast('Saved');
+    } catch (er) { toast(er.message); }
+  };
+  document.body.append(d);
+}
+async function pagePlaylist(id) {
+  const p = await api('/api/playlists/' + id);
+  view.innerHTML = `<div class="pad"><h1>${esc(p.name)}</h1><p style="color:var(--mute);margin:0 0 12px">${p.count} video${p.count === 1 ? '' : 's'} · by ${esc(p.owner.name)}</p>
+    <div style="display:flex;gap:8px;flex-wrap:wrap">${p.videos.length ? `<a class="btn sm" href="#/watch/${p.videos.find((v) => v.status === 'ready') ? p.videos.find((v) => v.status === 'ready').id : p.videos[0].id}/${p.id}" style="display:inline-block">▶ Play all</a>` : ''}
+    ${p.canManage ? '<button class="btn sm ghost" id="rn">Rename</button><button class="btn sm danger" id="dl">Delete playlist</button>' : ''}</div></div>
+    ${listHtml(p.videos, ['Empty playlist', 'Open any video and tap Save to add it here.'], p.id)}
+    ${p.canManage && p.videos.length ? '<div class="pad"><button class="btn sm ghost" id="rm">Remove a video…</button></div>' : ''}`;
+  if (p.canManage) {
+    $('#rn').onclick = async () => { const n = prompt('Playlist name', p.name); if (n && n.trim()) { await api('/api/playlists/' + id, { method: 'PATCH', json: { name: n } }); pagePlaylist(id); } };
+    $('#dl').onclick = async () => { if (confirm('Delete this playlist? The videos stay.')) { await api('/api/playlists/' + id, { method: 'DELETE' }); location.hash = '#/library'; } };
+    const rm = $('#rm');
+    if (rm) rm.onclick = async () => {
+      const n = prompt('Remove which video? Type its number:\n' + p.videos.map((v, i) => `${i + 1}. ${v.title}`).join('\n'));
+      const v = p.videos[Number(n) - 1]; if (!v) return;
+      await api(`/api/playlists/${id}/videos/${v.id}`, { method: 'DELETE' }); pagePlaylist(id);
+    };
+  }
+}
+
 async function pageLibrary() {
-  const [mine, liked] = await Promise.all([api('/api/videos?user=' + me.id), api('/api/videos?liked=1')]);
+  const [mine, liked, pls, users] = await Promise.all([api('/api/videos?user=' + me.id), api('/api/videos?liked=1'), api('/api/playlists'), me.admin ? api('/api/users') : []]);
   view.innerHTML = `<div class="profile">${avatar(me, 'lg')}<h1>${esc(me.name)}</h1></div>
+    <div class="tip" id="push"></div>
+    <h2>Playlists</h2>${pls.length ? pls.map(plRow).join('') : '<div class="empty" style="padding:12px">No playlists yet.</div>'}
+    <div class="pad"><button class="btn sm ghost" id="np">＋ New playlist</button></div>
     <h2>Your videos</h2>${listHtml(mine, ['Nothing yet', 'Videos you add will show up here.'])}
     <h2>Videos you liked</h2>${listHtml(liked, ['No likes yet', 'Tap the heart on a video.'])}
-    <div class="tip" id="tip"></div>
-    <div class="pad"><button class="btn ghost" id="out">Switch person / log out</button></div>`;
-  const standalone = navigator.standalone || matchMedia('(display-mode: standalone)').matches;
-  $('#tip').innerHTML = standalone ? 'Famtube is installed on your Home Screen. 🎉'
-    : 'Tip: tap the <b>Share</b> button in Safari, then <b>Add to Home Screen</b> to use Famtube like a real app.';
-  $('#out').onclick = async () => { await api('/api/logout', { method: 'POST' }); me = null; showLogin(); };
+    ${me.admin ? `<h2>Family</h2><div class="chips">${users.map((u) => `<span class="chip">${esc(u.name)}${u.id === me.id ? '' : ` <a href="#" data-reset="${u.id}" data-n="${esc(u.name)}" style="color:var(--accent)">reset password</a>`}</span>`).join('')}</div>` : ''}
+    <div class="pad" style="display:grid;gap:10px"><button class="btn ghost" id="pw">Change my password</button><button class="btn ghost" id="out">Switch person / log out</button></div>`;
+  $('#np').onclick = async () => { const p = await newPlaylist(); if (p) pageLibrary(); };
+  $('#pw').onclick = async () => {
+    const current = prompt('Your current password'); if (current === null) return;
+    const next = prompt('New password (at least 4 characters)'); if (!next) return;
+    try { await api('/api/me/password', { json: { current, next } }); toast('Password changed'); } catch (e) { toast(e.message); }
+  };
+  $('#out').onclick = async () => { await pushOff().catch(() => {}); await api('/api/logout', { method: 'POST' }); me = null; showLogin(); };
+  view.querySelectorAll('[data-reset]').forEach((a) => (a.onclick = async (e) => {
+    e.preventDefault();
+    if (confirm(`Reset ${a.dataset.n}'s password? They will choose a new one next time they sign in.`)) { await api(`/api/users/${a.dataset.reset}/reset-password`, { method: 'POST' }); toast('Password reset'); }
+  }));
+  renderPushCard();
   pollIfProcessing(mine, () => location.hash === '#/library' && pageLibrary().catch(() => {}));
 }
 
@@ -151,7 +244,7 @@ async function pageChannel(id) {
   view.innerHTML = `<div class="profile">${avatar(u, 'lg')}<h1>${esc(u.name)}</h1></div>${listHtml(list, ['No videos yet'])}`;
 }
 
-async function pageWatch(id) {
+async function pageWatch(id, listId = '') {
   document.body.className = 'watching';
   let v;
   try { v = await api('/api/videos/' + id); } catch (e) {
@@ -169,7 +262,7 @@ async function pageWatch(id) {
     <p class="wsub">${views(v.views)} · ${ago(v.created)}</p>
     <div class="row"><a class="who" href="#/u/${v.owner.id}">${avatar(v.owner)}<span>${esc(v.owner.name)}</span></a>
       <button class="pill ${v.liked ? 'on' : ''}" id="like">${v.liked ? '♥' : '♡'} <span>${v.likes}</span></button>
-      <button class="pill" id="share">Share</button></div>
+      <button class="pill" id="save">＋ Save</button><button class="pill" id="share">Share</button></div>
     ${v.desc ? `<div class="desc">${esc(v.desc)}</div>` : ''}
     ${v.canManage ? `<div class="row"><button class="pill" id="edit">Edit</button><button class="pill" id="del" style="color:var(--accent)">Delete</button></div>` : ''}
     <h2>Comments <span id="cc" style="color:var(--mute);font-weight:400">${v.comments}</span></h2>
@@ -178,7 +271,9 @@ async function pageWatch(id) {
     <h2>Up next</h2><div id="up"></div>`;
 
   $('#bk').onclick = () => (history.length > 1 ? history.back() : (location.hash = '#/'));
-  if (ready) setupPlayer(v);
+  const nav = { next: '' };
+  if (ready) setupPlayer(v, nav);
+  $('#save').onclick = () => savePicker(v.id).catch((e) => toast(e.message));
   $('#like').onclick = async () => { const r = await api(`/api/videos/${v.id}/like`, { method: 'POST' }); $('#like').className = 'pill' + (r.liked ? ' on' : ''); $('#like').innerHTML = `${r.liked ? '♥' : '♡'} <span>${r.likes}</span>`; };
   $('#share').onclick = async () => {
     const url = location.origin + '/#/watch/' + v.id;
@@ -200,18 +295,27 @@ async function pageWatch(id) {
     e.preventDefault(); const t = $('#ct').value.trim(); if (!t) return;
     try { await api(`/api/videos/${v.id}/comments`, { json: { text: t } }); $('#ct').value = ''; loadComments(v); } catch (er) { toast(er.message); }
   };
-  api('/api/videos').then((all) => { const o = all.filter((x) => x.id !== v.id && x.status === 'ready'); $('#up').innerHTML = o.length ? `<div class="grid">${o.map(card).join('')}</div>` : '<div class="empty">That is everything for now.</div>'; }).catch(() => {});
-  if (v.status === 'processing') pollTimer = setTimeout(() => location.hash === '#/watch/' + v.id && pageWatch(v.id), 4000);
+  const upTitle = $('#view h2:last-of-type');
+  (listId ? api('/api/playlists/' + listId).then((p) => ({ name: p.name, videos: p.videos })) : api('/api/videos').then((all) => ({ name: '', videos: all })))
+    .then(({ name, videos }) => {
+      const ready = videos.filter((x) => x.status === 'ready');
+      const i = ready.findIndex((x) => x.id === v.id);
+      const rest = listId && i >= 0 ? [...ready.slice(i + 1), ...ready.slice(0, i)] : ready.filter((x) => x.id !== v.id);
+      if (listId && i >= 0 && i < ready.length - 1) nav.next = `#/watch/${ready[i + 1].id}/${listId}`;
+      if (listId) upTitle.innerHTML = `${esc(name)} <span style="color:var(--mute);font-weight:400">${i + 1}/${ready.length}</span>`;
+      $('#up').innerHTML = rest.length ? `<div class="grid">${rest.map((x) => card(x, listId)).join('')}</div>` : '<div class="empty">That is everything for now.</div>';
+    }).catch(() => {});
+  if (v.status === 'processing') pollTimer = setTimeout(() => location.hash.startsWith('#/watch/' + v.id) && pageWatch(v.id, listId), 4000);
 }
 
-function setupPlayer(v) {
+function setupPlayer(v, nav) {
   const el = $('#v'), key = 'ft-pos-' + v.id;
   el.addEventListener('loadedmetadata', () => {
     const p = Number(lsGet(key)); if (p > 5 && p < el.duration - 5) el.currentTime = p;
   });
   let last = 0;
   el.addEventListener('timeupdate', () => { if (Date.now() - last > 3000) { last = Date.now(); lsSet(key, el.currentTime); } });
-  el.addEventListener('ended', () => lsSet(key, 0));
+  el.addEventListener('ended', () => { lsSet(key, 0); if (nav.next) location.hash = nav.next; });
   let counted = false;
   el.addEventListener('playing', () => { if (counted) return; counted = true; setTimeout(() => api(`/api/videos/${v.id}/view`, { method: 'POST' }).catch(() => {}), 3000); });
 }
@@ -229,13 +333,14 @@ async function route() {
   if (!me) return;
   clearTimeout(pollTimer);
   const h = location.hash.replace(/^#/, '') || '/';
-  const [, a, b] = h.split('/');
+  const [, a, b, c] = h.split('/');
   document.body.className = a === 'watch' ? 'watching' : '';
   document.title = 'Famtube';
-  document.querySelectorAll('#tabs a').forEach((t) => t.classList.toggle('on', t.dataset.t === ({ '': 'home', search: 'search', upload: 'upload', library: 'library', u: 'library' }[a] ?? 'home')));
+  document.querySelectorAll('#tabs a').forEach((t) => t.classList.toggle('on', t.dataset.t === ({ '': 'home', search: 'search', upload: 'upload', library: 'library', u: 'library', pl: 'library' }[a] ?? 'home')));
   const reset = () => { if (a !== 'watch') window.scrollTo(0, 0); };
   try {
-    if (a === 'watch') await pageWatch(b);
+    if (a === 'watch') await pageWatch(b, c);
+    else if (a === 'pl') await pagePlaylist(b);
     else if (a === 'u') await pageChannel(b);
     else if (a === 'search') await pageSearch();
     else if (a === 'upload') pageUpload();
@@ -248,8 +353,9 @@ async function route() {
 async function boot() {
   if (!me) { try { me = (await api('/api/me')).user; } catch { return; } }
   $('#me').innerHTML = avatar(me);
-  route();
+  route(); syncPush();
 }
 addEventListener('hashchange', route);
+if ('serviceWorker' in navigator) navigator.serviceWorker.addEventListener('message', (e) => { if (e.data && e.data.go) location.href = e.data.go; });
 if ('serviceWorker' in navigator) addEventListener('load', () => navigator.serviceWorker.register('/sw.js').catch(() => {}));
 boot();

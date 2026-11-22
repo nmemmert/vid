@@ -1,7 +1,7 @@
 FROM node:22-alpine
 RUN apk add --no-cache ffmpeg
 WORKDIR /app
-COPY package.json server.js ./
+COPY package.json server.js push.js ./
 COPY public ./public
 ENV DATA_DIR=/data PORT=3000 NODE_ENV=production
 VOLUME /data

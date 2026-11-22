@@ -9,6 +9,7 @@ services:
     environment:
       - FAMILY_PIN=change-me      # the family code everyone types to get in
       - MAX_UPLOAD_MB=4096        # biggest single video allowed
+      - PUSH_SUBJECT=mailto:you@example.com   # contact address for push services
       - TRUST_PROXY=              # set to 1 if behind a reverse proxy / tunnel
     volumes:
       - /DATA/AppData/famtube/data:/data

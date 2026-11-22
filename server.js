@@ -7,6 +7,7 @@ const path = require('path');
 const crypto = require('crypto');
 const { spawn, spawnSync } = require('child_process');
 const { Transform, pipeline } = require('stream');
+const webpush = require('./push');
 
 const MIME = {
   '.html': 'text/html; charset=utf-8', '.js': 'text/javascript; charset=utf-8',
@@ -36,6 +37,10 @@ function createServer(opts = {}) {
   let db;
   try { db = JSON.parse(fs.readFileSync(dbFile, 'utf8')); } catch { db = {}; }
   db.users ||= []; db.sessions ||= {}; db.videos ||= []; db.comments ||= [];
+  db.playlists ||= []; db.push ||= [];
+  if (!db.vapid) db.vapid = webpush.generateVapid();
+  const PUSH_SUBJECT = opts.pushSubject || process.env.PUSH_SUBJECT || 'mailto:famtube@example.com';
+  const ALLOW_HTTP_PUSH = !!opts.allowInsecurePush;
   let saveTimer = null;
   function save() {
     clearTimeout(saveTimer);
@@ -83,6 +88,27 @@ function createServer(opts = {}) {
     };
   }
   const visible = (v, me) => v.status === 'ready' || v.owner === me.id || me.admin;
+  // ---------- passwords ----------
+  const hashPw = (pw) => { const s = crypto.randomBytes(16); return s.toString('hex') + ':' + crypto.scryptSync(pw, s, 32).toString('hex'); };
+  const checkPw = (pw, stored) => {
+    const [s, h] = String(stored).split(':');
+    return crypto.timingSafeEqual(crypto.scryptSync(String(pw), Buffer.from(s, 'hex'), 32), Buffer.from(h, 'hex'));
+  };
+
+  // ---------- push notifications ----------
+  const pushed = []; // promises, so tests can wait
+  function notifyAll(exceptUser, payload) {
+    for (const sub of db.push.filter((s) => s.user !== exceptUser)) {
+      pushed.push(webpush.send(sub, payload, db.vapid, PUSH_SUBJECT).then((status) => {
+        if (status === 404 || status === 410) { db.push = db.push.filter((s) => s !== sub); save(); }
+      }).catch(() => {}));
+    }
+  }
+  function announce(v) {
+    const owner = db.users.find((u) => u.id === v.owner);
+    notifyAll(v.owner, { title: `New video from ${owner ? owner.name : 'family'}`, body: v.title, url: `/#/watch/${v.id}`, tag: 'video-' + v.id });
+  }
+  const dropFromPlaylists = (vid) => { for (const p of db.playlists) p.videos = p.videos.filter((x) => x !== vid); };
   const removeFiles = (id) => {
     for (const f of [path.join(dirs.media, id + '.mp4'), path.join(dirs.media, id + '.mov'), path.join(dirs.thumbs, id + '.jpg')]) fs.rmSync(f, { force: true });
   };
@@ -108,6 +134,7 @@ function createServer(opts = {}) {
       if (FFPROBE) v.duration = Math.round(parseFloat(await run(FFPROBE, ['-v', 'error', '-show_entries', 'format=duration', '-of', 'default=nw=1:nk=1', out])) || 0);
       await run(FFMPEG, ['-y', '-ss', String(Math.min(1, (v.duration || 2) / 2)), '-i', out, '-frames:v', '1', '-vf', 'scale=640:-2', thumb]).catch(() => {});
       v.size = fs.statSync(out).size; v.status = 'ready';
+      announce(v);
     } catch (e) {
       v.status = 'failed'; v.error = String(e.message).slice(-300);
     }
@@ -140,7 +167,7 @@ function createServer(opts = {}) {
       };
       db.videos.push(v);
       if (FFMPEG) { queue.push({ id, src: tmp }); pump(); }
-      else { fs.renameSync(tmp, path.join(dirs.media, id + ext)); v.status = 'ready'; v.ext = ext; }
+      else { fs.renameSync(tmp, path.join(dirs.media, id + ext)); v.status = 'ready'; v.ext = ext; announce(v); }
       save();
       send(res, 201, shapeVideo(v, me));
     });
@@ -194,10 +221,19 @@ function createServer(opts = {}) {
       fails.delete(ip);
       const name = String(b.name || '').trim().replace(/\s+/g, ' ').slice(0, 30);
       if (!name) return send(res, 400, { error: 'Type your name.' });
+      const pw = String(b.password || '');
       let u = db.users.find((x) => x.name.toLowerCase() === name.toLowerCase());
-      if (!u) {
-        u = { id: rid(4), name, color: COLORS[db.users.length % COLORS.length], admin: db.users.length === 0, created: Date.now() };
-        db.users.push(u);
+      if (u && u.pw) {
+        let ok = false; try { ok = checkPw(pw, u.pw); } catch { /* bad record */ }
+        if (!ok) { noteFail(ip); return send(res, 401, { error: `Wrong password for ${u.name}.` }); }
+      } else {
+        // new person, or someone from before passwords existed (or an admin reset): they choose one now
+        if (pw.length < 4) return send(res, 400, { error: u ? 'Choose a password (at least 4 characters) to protect your account.' : 'Choose a password of at least 4 characters.' });
+        if (!u) {
+          u = { id: rid(4), name, color: COLORS[db.users.length % COLORS.length], admin: db.users.length === 0, created: Date.now() };
+          db.users.push(u);
+        }
+        u.pw = hashPw(pw);
       }
       const token = rid(24);
       db.sessions[sha(token)] = { user: u.id, created: Date.now() };
@@ -214,6 +250,83 @@ function createServer(opts = {}) {
       return send(res, 200, { ok: true }, { 'Set-Cookie': 'ft=; Path=/; Max-Age=0' });
     }
     if (p === '/api/users') return send(res, 200, db.users.map(pubUser));
+    let um = /^\/api\/users\/([a-f0-9]+)\/reset-password$/.exec(p);
+    if (um && M === 'POST') {
+      if (!me.admin) return send(res, 403, { error: 'Only the admin can do that.' });
+      const u = db.users.find((x) => x.id === um[1]);
+      if (!u) return send(res, 404, { error: 'No such person.' });
+      delete u.pw;
+      for (const [k, s] of Object.entries(db.sessions)) if (s.user === u.id && u.id !== me.id) delete db.sessions[k];
+      save(); return send(res, 200, { ok: true });
+    }
+    if (p === '/api/me/password' && M === 'POST') {
+      const b = await readJson(req);
+      let ok = false; try { ok = !me.pw || checkPw(String(b.current || ''), me.pw); } catch { /* ignore */ }
+      if (!ok) return send(res, 401, { error: 'Your current password is not right.' });
+      if (String(b.next || '').length < 4) return send(res, 400, { error: 'New password must be at least 4 characters.' });
+      me.pw = hashPw(String(b.next)); save(); return send(res, 200, { ok: true });
+    }
+
+    // ----- push -----
+    if (p === '/api/push/key') return send(res, 200, { key: db.vapid.publicKey });
+    if (p === '/api/push/subscribe' && M === 'POST') {
+      const b = await readJson(req);
+      let ok = b && typeof b.endpoint === 'string' && b.keys && typeof b.keys.p256dh === 'string' && typeof b.keys.auth === 'string';
+      if (ok) { try { const e = new URL(b.endpoint); ok = e.protocol === 'https:' || (ALLOW_HTTP_PUSH && e.protocol === 'http:'); } catch { ok = false; } }
+      if (!ok) return send(res, 400, { error: 'Bad subscription.' });
+      db.push = db.push.filter((s) => s.endpoint !== b.endpoint);
+      db.push.push({ user: me.id, endpoint: b.endpoint, keys: { p256dh: b.keys.p256dh, auth: b.keys.auth }, created: Date.now() });
+      save(); return send(res, 201, { ok: true });
+    }
+    if (p === '/api/push/unsubscribe' && M === 'POST') {
+      const b = await readJson(req);
+      db.push = db.push.filter((s) => !(s.endpoint === b.endpoint && s.user === me.id)); save();
+      return send(res, 200, { ok: true });
+    }
+
+    // ----- playlists -----
+    const plView = (pl, withVideos) => {
+      const vids = pl.videos.map((id) => db.videos.find((v) => v.id === id)).filter((v) => v && visible(v, me));
+      const cover = vids.find((v) => v.status === 'ready');
+      const o = { id: pl.id, name: pl.name, owner: pubUser(db.users.find((u) => u.id === pl.owner)), count: vids.length, cover: cover ? cover.id : null, canManage: pl.owner === me.id || !!me.admin };
+      if (withVideos) o.videos = vids.map((v) => shapeVideo(v, me));
+      return o;
+    };
+    if (p === '/api/playlists' && M === 'GET') return send(res, 200, db.playlists.map((pl) => plView(pl)));
+    if (p === '/api/playlists' && M === 'POST') {
+      const name = String((await readJson(req)).name || '').trim().slice(0, 60);
+      if (!name) return send(res, 400, { error: 'Give the playlist a name.' });
+      const pl = { id: rid(4), name, owner: me.id, videos: [], created: Date.now() };
+      db.playlists.push(pl); save(); return send(res, 201, plView(pl));
+    }
+    const pm = /^\/api\/playlists\/([a-f0-9]+)(?:\/videos(?:\/([a-f0-9]+))?)?$/.exec(p);
+    if (pm) {
+      const pl = db.playlists.find((x) => x.id === pm[1]);
+      if (!pl) return send(res, 404, { error: 'Playlist not found.' });
+      const manage = pl.owner === me.id || me.admin;
+      const isVideos = p.includes('/videos');
+      if (!isVideos && M === 'GET') return send(res, 200, plView(pl, true));
+      if (!isVideos && M === 'PATCH') {
+        if (!manage) return send(res, 403, { error: 'Not yours.' });
+        const name = String((await readJson(req)).name || '').trim().slice(0, 60);
+        if (name) pl.name = name; save(); return send(res, 200, plView(pl));
+      }
+      if (!isVideos && M === 'DELETE') {
+        if (!manage) return send(res, 403, { error: 'Not yours.' });
+        db.playlists = db.playlists.filter((x) => x !== pl); save(); return send(res, 200, { ok: true });
+      }
+      if (isVideos && M === 'POST') { // anyone can add to a family playlist
+        const vid = String((await readJson(req)).video || '');
+        const v = db.videos.find((x) => x.id === vid);
+        if (!v || !visible(v, me)) return send(res, 404, { error: 'Video not found.' });
+        if (!pl.videos.includes(vid)) pl.videos.push(vid);
+        save(); return send(res, 200, plView(pl));
+      }
+      if (isVideos && M === 'DELETE' && pm[2]) {
+        if (!manage) return send(res, 403, { error: 'Only the playlist owner can remove videos.' });
+        pl.videos = pl.videos.filter((x) => x !== pm[2]); save(); return send(res, 200, plView(pl));
+      }
+    }
     if (p === '/api/upload' && M === 'POST') return upload(req, res, me, q);
 
     if (p === '/api/videos' && M === 'GET') {
@@ -243,7 +356,7 @@ function createServer(opts = {}) {
         if (v.owner !== me.id && !me.admin) return send(res, 403, { error: 'Not yours.' });
         db.videos = db.videos.filter((x) => x !== v);
         db.comments = db.comments.filter((c) => c.video !== v.id);
-        removeFiles(v.id); save(); return send(res, 200, { ok: true });
+        dropFromPlaylists(v.id); removeFiles(v.id); save(); return send(res, 200, { ok: true });
       }
       if (sub === 'view' && M === 'POST') { v.views++; save(); return send(res, 200, { views: v.views }); }
       if (sub === 'like' && M === 'POST') {
@@ -290,7 +403,7 @@ function createServer(opts = {}) {
       if (!res.headersSent) send(res, 400, { error: e.message });
     }
   });
-  server.flush = flush; server.idle = idle; server.hasFfmpeg = !!FFMPEG;
+  server.flush = flush; server.idle = async () => { await idle(); await Promise.all(pushed); }; server.hasFfmpeg = !!FFMPEG;
   return server;
 }
 
