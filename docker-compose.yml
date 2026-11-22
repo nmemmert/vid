@@ -1,0 +1,39 @@
+name: famtube
+services:
+  famtube:
+    image: ghcr.io/nmemmert/vid:latest
+    container_name: famtube
+    restart: unless-stopped
+    ports:
+      - "8086:3000"
+    environment:
+      - FAMILY_PIN=change-me      # the family code everyone types to get in
+      - MAX_UPLOAD_MB=4096        # biggest single video allowed
+      - TRUST_PROXY=              # set to 1 if behind a reverse proxy / tunnel
+    volumes:
+      - /DATA/AppData/famtube/data:/data
+    x-casaos:
+      envs:
+        - container: FAMILY_PIN
+          description: { en_us: "Family code needed to open the app" }
+        - container: MAX_UPLOAD_MB
+          description: { en_us: "Largest video allowed, in MB" }
+      ports:
+        - container: "3000"
+          description: { en_us: "Web UI port" }
+      volumes:
+        - container: /data
+          description: { en_us: "Videos and family data (keep this!)" }
+x-casaos:
+  architectures: [amd64, arm64]
+  main: famtube
+  index: /
+  port_map: "8086"
+  category: Media
+  author: nmemmert
+  developer: nmemmert
+  title: { en_us: Famtube }
+  tagline: { en_us: Private family videos, YouTube-style }
+  description:
+    en_us: Watch and share family videos from your iPhone. Upload, comment, like, and keep everything on your own server.
+  icon: https://raw.githubusercontent.com/nmemmert/vid/main/public/icon-512.png
