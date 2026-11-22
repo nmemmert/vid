@@ -28,7 +28,7 @@ function createServer(opts = {}) {
   const FFPROBE = FFMPEG && spawnSync('ffprobe', ['-version']).status === 0 ? 'ffprobe' : null;
   const PUBLIC = path.join(__dirname, 'public');
 
-  const dirs = { media: path.join(DATA_DIR, 'videos'), thumbs: path.join(DATA_DIR, 'thumbs'), tmp: path.join(DATA_DIR, 'tmp') };
+  const dirs = { media: path.join(DATA_DIR, 'videos'), thumbs: path.join(DATA_DIR, 'thumbs'), tmp: path.join(DATA_DIR, 'tmp'), parts: path.join(DATA_DIR, 'uploads') };
   Object.values(dirs).forEach((d) => fs.mkdirSync(d, { recursive: true }));
   for (const f of fs.readdirSync(dirs.tmp)) fs.rmSync(path.join(dirs.tmp, f), { force: true });
 
@@ -37,7 +37,10 @@ function createServer(opts = {}) {
   let db;
   try { db = JSON.parse(fs.readFileSync(dbFile, 'utf8')); } catch { db = {}; }
   db.users ||= []; db.sessions ||= {}; db.videos ||= []; db.comments ||= [];
-  db.playlists ||= []; db.push ||= [];
+  db.playlists ||= []; db.push ||= []; db.uploads ||= [];
+  for (const v of db.videos) if (v.status === 'processing') { v.status = 'failed'; v.error = 'Interrupted by a restart. Please upload it again.'; }
+  for (const u of db.uploads.filter((x) => Date.now() - x.created > 3 * 86400e3)) fs.rmSync(path.join(DATA_DIR, 'uploads', u.id + '.part'), { force: true });
+  db.uploads = db.uploads.filter((x) => Date.now() - x.created <= 3 * 86400e3);
   if (!db.vapid) db.vapid = webpush.generateVapid();
   const PUSH_SUBJECT = opts.pushSubject || process.env.PUSH_SUBJECT || 'mailto:famtube@example.com';
   const ALLOW_HTTP_PUSH = !!opts.allowInsecurePush;
@@ -97,8 +100,10 @@ function createServer(opts = {}) {
 
   // ---------- push notifications ----------
   const pushed = []; // promises, so tests can wait
-  function notifyAll(exceptUser, payload) {
-    for (const sub of db.push.filter((s) => s.user !== exceptUser)) {
+  const wants = (uid, kind) => { const u = db.users.find((x) => x.id === uid); return !u || !u.notify || u.notify[kind] !== false; };
+  function notifyUsers(userIds, payload, kind) {
+    const ids = new Set(userIds.filter((id) => wants(id, kind)));
+    for (const sub of db.push.filter((s) => ids.has(s.user))) {
       pushed.push(webpush.send(sub, payload, db.vapid, PUSH_SUBJECT).then((status) => {
         if (status === 404 || status === 410) { db.push = db.push.filter((s) => s !== sub); save(); }
       }).catch(() => {}));
@@ -106,7 +111,14 @@ function createServer(opts = {}) {
   }
   function announce(v) {
     const owner = db.users.find((u) => u.id === v.owner);
-    notifyAll(v.owner, { title: `New video from ${owner ? owner.name : 'family'}`, body: v.title, url: `/#/watch/${v.id}`, tag: 'video-' + v.id });
+    notifyUsers(db.users.map((u) => u.id).filter((id) => id !== v.owner),
+      { title: `New video from ${owner ? owner.name : 'family'}`, body: v.title, url: `/#/watch/${v.id}`, tag: 'video-' + v.id }, 'videos');
+  }
+  // the video's owner and anyone already chatting on it hear about new comments
+  function announceComment(v, c, author) {
+    const who = new Set([v.owner, ...db.comments.filter((x) => x.video === v.id).map((x) => x.user)]);
+    who.delete(author.id);
+    notifyUsers([...who], { title: `${author.name} commented on ${v.title}`.slice(0, 80), body: c.text.slice(0, 140), url: `/#/watch/${v.id}`, tag: 'comment-' + v.id }, 'comments');
   }
   const dropFromPlaylists = (vid) => { for (const p of db.playlists) p.videos = p.videos.filter((x) => x !== vid); };
   const removeFiles = (id) => {
@@ -149,27 +161,67 @@ function createServer(opts = {}) {
   const idle = () => new Promise((r) => { const t = setInterval(() => { if (!working && !queue.length) { clearInterval(t); r(); } }, 20); });
 
   // ---------- handlers ----------
+  const isVideoType = (t) => t.startsWith('video/') || t.startsWith('application/octet-stream');
+  function createVideo(me, { title, desc, tmp, size, type }) {
+    const id = rid(5);
+    const v = {
+      id, title: String(title || 'Untitled').trim().slice(0, 120) || 'Untitled', desc: String(desc || '').trim().slice(0, 2000),
+      owner: me.id, created: Date.now(), status: 'processing', duration: 0, views: 0, likes: [], size,
+    };
+    db.videos.push(v);
+    if (FFMPEG) { const src = path.join(dirs.tmp, id + '.src'); fs.renameSync(tmp, src); queue.push({ id, src }); pump(); }
+    else { const ext = type.includes('quicktime') ? '.mov' : '.mp4'; fs.renameSync(tmp, path.join(dirs.media, id + ext)); v.status = 'ready'; v.ext = ext; announce(v); }
+    save();
+    return v;
+  }
+
+  // One-shot upload (kept for simple clients).
   async function upload(req, res, me, q) {
     const type = (req.headers['content-type'] || '').toLowerCase();
-    if (!type.startsWith('video/') && !type.startsWith('application/octet-stream')) return send(res, 415, { error: 'That is not a video file.' });
-    const len = Number(req.headers['content-length'] || 0);
-    if (len > MAX_BYTES) return send(res, 413, { error: 'That video is too big for this server.' });
-    const id = rid(5);
-    const ext = type.includes('quicktime') ? '.mov' : '.mp4';
-    const tmp = path.join(dirs.tmp, id + '.src');
+    if (!isVideoType(type)) return send(res, 415, { error: 'That is not a video file.' });
+    if (Number(req.headers['content-length'] || 0) > MAX_BYTES) return send(res, 413, { error: 'That video is too big for this server.' });
+    const tmp = path.join(dirs.tmp, rid(5) + '.up');
     let seen = 0;
     const counter = new Transform({ transform(chunk, _e, cb) { seen += chunk.length; cb(seen > MAX_BYTES ? new Error('too big') : null, chunk); } });
     pipeline(req, counter, fs.createWriteStream(tmp), (err) => {
       if (err || seen === 0) { fs.rmSync(tmp, { force: true }); return send(res, err ? 413 : 400, { error: err ? 'Upload failed or was too big.' : 'Empty upload.' }); }
-      const v = {
-        id, title: String(q.get('title') || 'Untitled').trim().slice(0, 120) || 'Untitled', desc: String(q.get('desc') || '').trim().slice(0, 2000),
-        owner: me.id, created: Date.now(), status: 'processing', duration: 0, views: 0, likes: [], size: seen,
-      };
-      db.videos.push(v);
-      if (FFMPEG) { queue.push({ id, src: tmp }); pump(); }
-      else { fs.renameSync(tmp, path.join(dirs.media, id + ext)); v.status = 'ready'; v.ext = ext; announce(v); }
-      save();
-      send(res, 201, shapeVideo(v, me));
+      send(res, 201, shapeVideo(createVideo(me, { title: q.get('title'), desc: q.get('desc'), tmp, size: seen, type }), me));
+    });
+  }
+
+  // Resumable upload: start a session, PUT chunks at the right offset, ask where you are after a drop.
+  const partPath = (id) => path.join(dirs.parts, id + '.part');
+  const partSize = (id) => { try { return fs.statSync(partPath(id)).size; } catch { return 0; } };
+  const busy = new Set();
+  async function startUpload(req, res, me) {
+    const b = await readJson(req);
+    const size = Number(b.size), type = String(b.type || 'video/mp4').toLowerCase();
+    if (!Number.isFinite(size) || size <= 0) return send(res, 400, { error: 'Missing file size.' });
+    if (size > MAX_BYTES) return send(res, 413, { error: 'That video is too big for this server.' });
+    if (!isVideoType(type)) return send(res, 415, { error: 'That is not a video file.' });
+    const u = { id: rid(8), user: me.id, title: String(b.title || '').slice(0, 120), desc: String(b.desc || '').slice(0, 2000), size, type, created: Date.now() };
+    db.uploads.push(u); fs.writeFileSync(partPath(u.id), ''); save();
+    return send(res, 201, { id: u.id, offset: 0, size });
+  }
+  async function uploadChunk(req, res, me, id, q) {
+    const u = db.uploads.find((x) => x.id === id && x.user === me.id);
+    if (!u) return send(res, 404, { error: 'That upload expired. Start it again.' });
+    if (req.method === 'GET') return send(res, 200, { id, offset: partSize(id), size: u.size });
+    if (req.method === 'DELETE') { db.uploads = db.uploads.filter((x) => x !== u); fs.rmSync(partPath(id), { force: true }); save(); return send(res, 200, { ok: true }); }
+    if (busy.has(id)) return send(res, 409, { error: 'Chunk already in progress.', offset: partSize(id) });
+    const have = partSize(id), offset = Number(q.get('offset'));
+    if (offset !== have) return send(res, 409, { error: 'Out of sync.', offset: have });
+    const len = Number(req.headers['content-length'] || 0);
+    if (!len || have + len > u.size) return send(res, 400, { error: 'Bad chunk size.', offset: have });
+    busy.add(id);
+    pipeline(req, fs.createWriteStream(partPath(id), { flags: 'a' }), (err) => {
+      busy.delete(id);
+      const now = partSize(id);
+      if (err || now - have !== len) { try { fs.truncateSync(partPath(id), have); } catch { /* ignore */ } return send(res, 400, { error: 'Chunk was cut off. Retrying…', offset: have }); }
+      if (now < u.size) return send(res, 200, { offset: now, done: false });
+      db.uploads = db.uploads.filter((x) => x !== u);
+      const tmp = path.join(dirs.tmp, id + '.up'); fs.renameSync(partPath(id), tmp);
+      send(res, 201, { offset: now, done: true, video: shapeVideo(createVideo(me, { title: u.title, desc: u.desc, tmp, size: u.size, type: u.type }), me) });
     });
   }
 
@@ -244,7 +296,13 @@ function createServer(opts = {}) {
     const me = userFromReq(req);
     if (!me) return send(res, 401, { error: 'login' });
 
-    if (p === '/api/me' && M === 'GET') return send(res, 200, { user: pubUser(me) });
+    if (p === '/api/me' && M === 'GET') return send(res, 200, { user: pubUser(me), notify: { videos: true, comments: true, ...(me.notify || {}) } });
+    if (p === '/api/me/notify' && M === 'POST') {
+      const b = await readJson(req);
+      me.notify = { videos: true, comments: true, ...(me.notify || {}) };
+      for (const k of ['videos', 'comments']) if (typeof b[k] === 'boolean') me.notify[k] = b[k];
+      save(); return send(res, 200, { notify: me.notify });
+    }
     if (p === '/api/logout' && M === 'POST') {
       delete db.sessions[sha(cookies(req).ft)]; save();
       return send(res, 200, { ok: true }, { 'Set-Cookie': 'ft=; Path=/; Max-Age=0' });
@@ -328,6 +386,9 @@ function createServer(opts = {}) {
       }
     }
     if (p === '/api/upload' && M === 'POST') return upload(req, res, me, q);
+    if (p === '/api/uploads' && M === 'POST') return startUpload(req, res, me);
+    const upm = /^\/api\/uploads\/([a-f0-9]+)$/.exec(p);
+    if (upm) return uploadChunk(req, res, me, upm[1], q);
 
     if (p === '/api/videos' && M === 'GET') {
       const term = (q.get('q') || '').toLowerCase().trim();
@@ -371,7 +432,7 @@ function createServer(opts = {}) {
         const text = String((await readJson(req)).text || '').trim().slice(0, 1000);
         if (!text) return send(res, 400, { error: 'Write something first.' });
         const c = { id: rid(4), video: v.id, user: me.id, text, created: Date.now() };
-        db.comments.push(c); save();
+        db.comments.push(c); save(); announceComment(v, c, me);
         return send(res, 201, { id: c.id, text, created: c.created, user: pubUser(me), mine: true });
       }
     }

@@ -148,3 +148,61 @@ test('push: subscribe, encrypted delivery on new video, dead subscriptions prune
   assert.strictEqual(got.length, 2, 'no more pushes after 410');
   svc.close();
 });
+
+test('resumable upload: chunks, resume after a drop, out-of-sync rejected', async (t) => {
+  if (!server.hasFfmpeg) return t.skip('needs ffmpeg');
+  const dad = (await login('Dad')).cookie, kid = (await login('Kid')).cookie;
+  const f = path.join(dataDir, 'in3.mp4');
+  spawnSync('ffmpeg', ['-y', '-f', 'lavfi', '-i', 'testsrc=size=160x120:rate=10:duration=1', '-pix_fmt', 'yuv420p', f]);
+  const data = fs.readFileSync(f), cut = Math.floor(data.length / 3);
+  const start = await call(dad, '/api/uploads', { method: 'POST', body: JSON.stringify({ size: data.length, type: 'video/mp4', title: 'Chunky' }) });
+  assert.strictEqual(start.status, 201);
+  const { id } = await start.json();
+  const put = (c, offset, body) => call(c, `/api/uploads/${id}?offset=${offset}`, { method: 'PUT', body, headers: { 'content-type': 'application/octet-stream' } });
+  assert.strictEqual((await put(kid, 0, data.subarray(0, cut))).status, 404, "someone else's upload");
+  const r1 = await put(dad, 0, data.subarray(0, cut));
+  assert.strictEqual(r1.status, 200); assert.strictEqual((await r1.json()).offset, cut);
+  // phone thinks nothing arrived and resends from 0: server says where it really is
+  const bad = await put(dad, 0, data.subarray(0, cut));
+  assert.strictEqual(bad.status, 409); assert.strictEqual((await bad.json()).offset, cut);
+  assert.strictEqual((await call(dad, `/api/uploads/${id}`).then((x) => x.json())).offset, cut);
+  assert.strictEqual((await put(dad, cut, data.subarray(cut, cut * 2))).status, 200);
+  const last = await put(dad, cut * 2, data.subarray(cut * 2));
+  assert.strictEqual(last.status, 201);
+  const out = await last.json();
+  assert.ok(out.done); assert.strictEqual(out.video.title, 'Chunky');
+  await server.idle();
+  assert.strictEqual((await call(dad, '/api/videos/' + out.video.id).then((x) => x.json())).status, 'ready');
+  assert.strictEqual((await call(dad, `/api/uploads/${id}`)).status, 404, 'session closed');
+  assert.strictEqual((await call(dad, '/api/uploads', { method: 'POST', body: JSON.stringify({ size: 10, type: 'text/plain' }) })).status, 415);
+});
+
+test('comment notifications go to the owner and other commenters, respect prefs', async (t) => {
+  if (!server.hasFfmpeg) return t.skip('needs ffmpeg');
+  const dad = (await login('Dad')).cookie, mom = (await login('Mom')).cookie, kid = (await login('Kid')).cookie;
+  const got = {};
+  const subscribe = async (name, cookie) => {
+    const ua = crypto.createECDH('prime256v1'); ua.generateKeys();
+    const svc = http.createServer((req, res) => { req.resume(); req.on('end', () => { got[name] = (got[name] || 0) + 1; res.writeHead(201); res.end(); }); });
+    await new Promise((r) => svc.listen(0, r));
+    await call(cookie, '/api/push/subscribe', { method: 'POST', body: JSON.stringify({ endpoint: `http://127.0.0.1:${svc.address().port}/p`, keys: { p256dh: webpush.b64u(ua.getPublicKey()), auth: webpush.b64u(crypto.randomBytes(16)) } }) });
+    return svc;
+  };
+  const svcs = [await subscribe('dad', dad), await subscribe('mom', mom), await subscribe('kid', kid)];
+  // Dad's video; his own push subscription from earlier tests may exist, so count from here
+  await call(dad, '/api/me/notify', { method: 'POST', body: JSON.stringify({ videos: false }) });
+  const mk = path.join(dataDir, 'in3.mp4');
+  const v = await call(dad, '/api/upload?title=Comments', { method: 'POST', body: fs.readFileSync(mk), headers: { 'content-type': 'video/mp4' } }).then((x) => x.json());
+  await server.idle();
+  for (const k of Object.keys(got)) got[k] = 0;
+  const say = (c, text) => call(c, `/api/videos/${v.id}/comments`, { method: 'POST', body: JSON.stringify({ text }) });
+  await say(mom, 'first!'); await server.idle();
+  assert.strictEqual(got.dad, 1, 'owner hears about it'); assert.ok(!got.mom && !got.kid, 'author and bystanders do not');
+  await say(kid, 'me too'); await server.idle();
+  assert.strictEqual(got.dad, 2); assert.strictEqual(got.mom, 1, 'earlier commenter hears the next one');
+  await call(mom, '/api/me/notify', { method: 'POST', body: JSON.stringify({ comments: false }) });
+  await say(kid, 'again'); await server.idle();
+  assert.strictEqual(got.mom, 1, 'opted out');
+  assert.strictEqual((await call(mom, '/api/me').then((x) => x.json())).notify.comments, false);
+  svcs.forEach((s) => s.close());
+});

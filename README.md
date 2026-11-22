@@ -5,9 +5,9 @@ A private, YouTube-style video app for your family, built as an **iPhone-first P
 ## What it does
 - **Home feed** of family videos with thumbnails, durations, view counts
 - **Watch page**: inline playback (`playsinline`), resume where you left off, like, share, comments, "Up next"
-- **Add** a video straight from the camera roll, with upload progress
+- **Add** a video straight from the camera roll, with progress. Uploads are chunked and **resumable**: if your signal drops it retries on its own, and if you close the app just pick the same video again to carry on
 - **Search**, **profile pages** per person, and a **You** tab with your videos and likes
-- **Push notifications** when someone adds a video (iOS 16.4+, once installed on the Home Screen)
+- **Push notifications** for new videos and for comments on videos you posted or joined in on (iOS 16.4+, once installed on the Home Screen). Each type can be switched off on the **You** tab
 - **Playlists**: family-wide, anyone can add; "Play all" auto-plays the next video
 - **Sign in** with the family code, your name and your own password (you choose it the first time)
 - iPhone `.mov`/HEVC uploads are converted to H.264 MP4 with ffmpeg so they play on every device

@@ -104,7 +104,7 @@ function pageUpload() {
     <div class="bar" hidden><div></div></div>
     <div class="err" id="err"></div>
     <button class="btn" id="go" disabled>Upload</button>
-    <p style="color:var(--mute);font-size:13px;margin:0">Keep this screen open until it finishes. Long videos take a minute to get ready afterwards.</p></form>`;
+    <p style="color:var(--mute);font-size:13px;margin:0">If your signal drops, just choose the same video again and it carries on where it stopped. Long videos take a minute to get ready afterwards.</p></form>`;
   const file = $('#file'), go = $('#go');
   file.onchange = () => {
     const f = file.files[0]; if (!f) return;
@@ -112,23 +112,61 @@ function pageUpload() {
     if (!$('#title').value) $('#title').value = f.name.replace(/\.[^.]+$/, '').replace(/[_-]+/g, ' ').slice(0, 120);
     go.disabled = false;
   };
-  $('#uf').onsubmit = (e) => {
+  $('#uf').onsubmit = async (e) => {
     e.preventDefault();
     const f = file.files[0]; if (!f) return;
     go.disabled = true; go.textContent = 'Uploading…';
-    const bar = $('.bar'); bar.hidden = false;
-    const xhr = new XMLHttpRequest();
-    xhr.open('POST', '/api/upload?title=' + encodeURIComponent($('#title').value.trim() || 'Untitled') + '&desc=' + encodeURIComponent($('#desc').value));
-    xhr.setRequestHeader('Content-Type', f.type || 'video/mp4');
-    xhr.upload.onprogress = (ev) => { if (ev.lengthComputable) { const p = ev.loaded / ev.total * 100; $('div', bar).style.width = p + '%'; go.textContent = `Uploading… ${Math.round(p)}%`; } };
-    xhr.onload = () => {
-      let d = {}; try { d = JSON.parse(xhr.responseText); } catch { /* ignore */ }
-      if (xhr.status === 201) { toast('Uploaded! Getting it ready…'); location.hash = '#/'; }
-      else { $('#err').textContent = d.error || 'Upload failed.'; go.disabled = false; go.textContent = 'Try again'; }
-    };
-    xhr.onerror = () => { $('#err').textContent = 'Connection lost. Try again.'; go.disabled = false; go.textContent = 'Try again'; };
-    xhr.send(f);
+    const bar = $('.bar'); bar.hidden = false; $('#err').textContent = '';
+    let lock = null; try { if (navigator.wakeLock) lock = await navigator.wakeLock.request('screen'); } catch { /* optional */ }
+    const meta = { title: $('#title').value.trim() || 'Untitled', desc: $('#desc').value };
+    try {
+      await uploadFile(f, meta, (done, note) => {
+        const p = done / f.size * 100; $('div', bar).style.width = p + '%';
+        go.textContent = note || `Uploading… ${Math.round(p)}%`;
+      });
+      toast('Uploaded! Getting it ready…'); location.hash = '#/';
+    } catch (er) { $('#err').textContent = er.message; go.disabled = false; go.textContent = 'Try again (it picks up where it stopped)'; }
+    finally { if (lock) lock.release().catch(() => {}); }
   };
+}
+
+// Chunked, resumable upload: survives flaky cellular, locked screens and even closing the app.
+const CHUNK = 4 * 1024 * 1024;
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+function putChunk(id, offset, blob, onBytes) {
+  return new Promise((resolve) => {
+    const x = new XMLHttpRequest();
+    x.open('PUT', `/api/uploads/${id}?offset=${offset}`);
+    x.timeout = 120000;
+    x.upload.onprogress = (e) => onBytes(offset + e.loaded);
+    x.onload = () => { let data = {}; try { data = JSON.parse(x.responseText); } catch { /* ignore */ } resolve({ status: x.status, data }); };
+    x.onerror = x.ontimeout = x.onabort = () => resolve({ status: 0, data: {} });
+    x.send(blob);
+  });
+}
+async function uploadFile(f, meta, onProgress) {
+  const key = `ft-up:${me.id}:${f.name}:${f.size}:${f.lastModified}`;
+  let id = lsGet(key) || '', offset = 0;
+  if (id) { try { offset = (await api('/api/uploads/' + id)).offset; } catch (e) { if (e.message === 'login') throw e; id = ''; } }
+  if (!id) { id = (await api('/api/uploads', { json: { size: f.size, type: f.type || 'video/mp4', ...meta } })).id; lsSet(key, id); }
+  let fails = 0;
+  while (offset < f.size) {
+    onProgress(offset);
+    const r = await putChunk(id, offset, f.slice(offset, Math.min(offset + CHUNK, f.size)), (n) => onProgress(n));
+    if (r.status === 200 || r.status === 201) {
+      fails = 0; offset = r.data.offset;
+      if (r.data.done) { lsSet(key, ''); return r.data.video; }
+    } else if (r.status === 401) { me = null; showLogin(); throw new Error('Please sign in again, then pick the video again.'); }
+    else if (r.status === 404) { lsSet(key, ''); throw new Error('That upload expired. Try again.'); }
+    else if (r.status === 413 || r.status === 415) { lsSet(key, ''); throw new Error(r.data.error || 'This video can not be uploaded.'); }
+    else { // dropped connection, or the server and phone disagree about the offset: ask, then retry
+      if (++fails > 10) throw new Error('Connection kept dropping. Try again when you have a better signal.');
+      onProgress(offset, 'Connection lost. Retrying…');
+      await sleep(Math.min(1500 * fails, 12000));
+      if (typeof r.data.offset === 'number') offset = r.data.offset;
+      else { try { offset = (await api('/api/uploads/' + id)).offset; } catch (e) { if (e.message === 'login') throw e; } }
+    }
+  }
 }
 
 // ---------- push notifications ----------
@@ -156,7 +194,14 @@ async function renderPushCard() {
   }
   const { sub } = await pushSub();
   const on = !!sub && Notification.permission === 'granted';
-  el.innerHTML = `<b>New video alerts</b><br>${on ? 'On for this phone.' : 'Get a notification when someone adds a video.'}<div style="margin-top:10px"><button class="btn sm ${on ? 'ghost' : ''}" id="pt">${on ? 'Turn off' : 'Turn on notifications'}</button></div>`;
+  el.innerHTML = `<b>New video alerts</b><br>${on ? 'On for this phone.' : 'Get a notification when someone adds a video.'}<div style="margin-top:10px"><button class="btn sm ${on ? 'ghost' : ''}" id="pt">${on ? 'Turn off' : 'Turn on notifications'}</button></div>
+    ${on ? `<div style="margin-top:12px;display:grid;gap:8px"><label><input type="checkbox" id="nv"> New videos</label><label><input type="checkbox" id="nc"> Comments on videos I'm part of</label></div>` : ''}`;
+  if (on) {
+    const prefs = (await api('/api/me')).notify;
+    $('#nv').checked = prefs.videos; $('#nc').checked = prefs.comments;
+    $('#nv').onchange = (e) => api('/api/me/notify', { json: { videos: e.target.checked } });
+    $('#nc').onchange = (e) => api('/api/me/notify', { json: { comments: e.target.checked } });
+  }
   $('#pt').onclick = async () => {
     try { on ? await pushOff() : await pushOn(); toast(on ? 'Notifications off' : 'Notifications on'); } catch (e) { toast(e.message); }
     renderPushCard();
