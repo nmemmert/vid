@@ -36,6 +36,13 @@ iPhones need **HTTPS** for the PWA to install and for the service worker. Away f
 ## Notifications
 Open Famtube **from the Home Screen icon** (Safari tabs can't receive push on iPhone), go to **You** and tap **Turn on notifications**. It needs iOS 16.4 or newer and HTTPS. Push keys are created on first start and stored in `db.json`, so keep the `/data` volume or everyone has to turn notifications on again.
 
+## CI on Gitea (or GitHub)
+- **Gitea Actions** (`.gitea/workflows/`): `ci.yml` syntax-checks and runs the tests on every push and PR; `image.yml` builds a multi-arch Docker image and pushes it to your Gitea registry (`<gitea-host>/<owner>/<repo>:latest`, plus a tag for `v*` releases) when `main` changes.
+  - Add a repo secret **`REGISTRY_TOKEN`**: a Gitea access token with the `write:package` scope.
+  - You need a registered `act_runner` with an `ubuntu-latest` label and Docker access. If your runner is amd64-only and has no QEMU, change `platforms` to `linux/amd64`.
+  - To run the Gitea image on ZimaOS, set `image:` in `docker-compose.yml` to the Gitea registry path.
+- **GitHub Actions** (`.github/workflows/`) still builds the GitHub Container Registry image. Gitea only reads `.github/workflows` when there is no `.gitea/workflows`, so each host runs just its own.
+
 ## Notes
 - The first person to sign in is the admin and can remove anyone's videos or comments.
 - The family code lets someone *join*; after that each person's name is protected by their own password. If someone forgets theirs, the admin can reset it on the **You** tab and they choose a new one.

@@ -1,0 +1,21 @@
+name: CI
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      # ffmpeg powers the upload/convert tests; they skip themselves if it can't be installed
+      - name: Install ffmpeg
+        run: |
+          (sudo -n true 2>/dev/null && SUDO=sudo || SUDO=)
+          $SUDO apt-get update -qq && $SUDO apt-get install -y -qq ffmpeg || echo "ffmpeg not installed; conversion tests will be skipped"
+      - run: node --check server.js && node --check push.js && node --check public/app.js
+      - run: npm test
